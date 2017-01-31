@@ -22,9 +22,10 @@
 -export([all/0, suite/0,groups/0,init_per_suite/1, end_per_suite/1, 
 	 init_per_group/2,end_per_group/2, borderline/1, atomic/1, long_names/1,
 	 create_long_names/1, bad_tar/1, errors/1, extract_from_binary/1,
-	 extract_from_binary_compressed/1,
+	 extract_from_binary_compressed/1, extract_filtered/1,
 	 extract_from_open_file/1, symlinks/1, open_add_close/1, cooked_compressed/1,
-	 memory/1,unicode/1]).
+	 memory/1,unicode/1,read_other_implementations/1,
+         sparse/1, init/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("kernel/include/file.hrl").
@@ -35,7 +36,10 @@ all() ->
     [borderline, atomic, long_names, create_long_names,
      bad_tar, errors, extract_from_binary,
      extract_from_binary_compressed, extract_from_open_file,
-     symlinks, open_add_close, cooked_compressed, memory, unicode].
+     extract_filtered,
+     symlinks, open_add_close, cooked_compressed, memory, unicode,
+     read_other_implementations,
+     sparse,init].
 
 groups() -> 
     [].
@@ -357,7 +361,7 @@ make_dirs([], Dir) ->
 %% Try erl_tar:table/2 and erl_tar:extract/2 on some corrupted tar files.
 bad_tar(Config) when is_list(Config) ->
     try_bad("bad_checksum", bad_header, Config),
-    try_bad("bad_octal",    bad_header, Config),
+    try_bad("bad_octal",    {bad_header, invalid_octal_value}, Config),
     try_bad("bad_too_short",    eof, Config),
     try_bad("bad_even_shorter", eof, Config),
     ok.
@@ -370,8 +374,10 @@ try_bad(Name0, Reason, Config) ->
     Name = Name0 ++ ".tar",
     io:format("~nTrying ~s", [Name]),
     Full = filename:join(DataDir, Name),
-    Opts = [verbose, {cwd, PrivDir}],
+    Dest = filename:join(PrivDir, Name0),
+    Opts = [verbose, {cwd, Dest}],
     Expected = {error, Reason},
+    io:fwrite("Expected: ~p\n", [Expected]),
     case {erl_tar:table(Full, Opts), erl_tar:extract(Full, Opts)} of
 	{Expected, Expected} ->
 	    io:format("Result: ~p", [Expected]),
@@ -489,6 +495,27 @@ extract_from_binary_compressed(Config) when is_list(Config) ->
 		  end, Files),
 
     %% Clean up the rest.
+    delete_files([ExtractDir]),
+
+    ok.
+
+%% Test extracting a tar archive from a binary.
+extract_filtered(Config) when is_list(Config) ->
+    DataDir = proplists:get_value(data_dir, Config),
+    PrivDir = proplists:get_value(priv_dir, Config),
+    Long = filename:join(DataDir, "no_fancy_stuff.tar"),
+    ExtractDir = filename:join(PrivDir, "extract_from_binary"),
+    ok = file:make_dir(ExtractDir),
+
+    ok = erl_tar:extract(Long, [{cwd,ExtractDir},{files,["no_fancy_stuff/EPLICENCE"]}]),
+
+    %% Verify.
+    Dir = filename:join(ExtractDir, "no_fancy_stuff"),
+    true = filelib:is_dir(Dir),
+    false = filelib:is_file(filename:join(Dir, "a_dir_list")),
+    true = filelib:is_file(filename:join(Dir, "EPLICENCE")),
+
+    %% Clean up.
     delete_files([ExtractDir]),
 
     ok.
@@ -619,12 +646,46 @@ long_symlink(Dir) ->
     ok = file:set_cwd(Dir),
 
     AFile = "long_symlink",
-    FarTooLong = "/tmp/aarrghh/this/path/is/far/longer/than/one/hundred/characters/which/is/the/maximum/number/of/characters/allowed",
-    ok = file:make_symlink(FarTooLong, AFile),
-    {error,Error} = erl_tar:create(Tar, [AFile], [verbose]),
-    io:format("Error: ~s\n", [erl_tar:format_error(Error)]),
-    {FarTooLong,symbolic_link_too_long} = Error,
+    RequiresPAX = "/tmp/aarrghh/this/path/is/far/longer/than/one/hundred/characters/which/is/the/maximum/number/of/characters/allowed",
+    ok = file:make_symlink(RequiresPAX, AFile),
+    ok = erl_tar:create(Tar, [AFile], [verbose]),
+    NewDir = filename:join(Dir, "extracted"),
+    _ = file:make_dir(NewDir),
+    ok = erl_tar:extract(Tar, [{cwd, NewDir}, verbose]),
+    ok = file:set_cwd(NewDir),
+    {ok, #file_info{type=symlink}} = file:read_link_info(AFile),
+    {ok, RequiresPAX} = file:read_link(AFile),
     ok.
+
+init(Config) when is_list(Config) ->
+    PrivDir = proplists:get_value(priv_dir, Config),
+    ok = file:set_cwd(PrivDir),
+    Dir = filename:join(PrivDir, "init"),
+    ok = file:make_dir(Dir),
+
+    [{FileOne,_,_}|_] = oac_files(),
+    TarOne = filename:join(Dir, "archive1.tar"),
+    {ok,Fd} = file:open(TarOne, [write]),
+    % If the arity of the fun is wrong, badarg should be returned
+    {error, badarg} = erl_tar:init(Fd, write, fun file_op_bad/1),
+    % Otherwise we should be good to go
+    {ok, Tar} = erl_tar:init(Fd, write, fun file_op/2),
+    ok = erl_tar:add(Tar, FileOne, []),
+    ok = erl_tar:close(Tar),
+    {ok, [FileOne]} = erl_tar:table(TarOne),
+    ok.
+
+file_op_bad(_) ->
+    throw({error, should_never_be_called}).
+
+file_op(write, {Fd, Data}) ->
+    file:write(Fd, Data);
+file_op(position, {Fd, Pos}) ->
+    file:position(Fd, Pos);
+file_op(read2, {Fd, Size}) ->
+    file:read(Fd, Size);
+file_op(close, Fd) ->
+    file:close(Fd).
 
 open_add_close(Config) when is_list(Config) ->
     PrivDir = proplists:get_value(priv_dir, Config),
@@ -643,8 +704,12 @@ open_add_close(Config) when is_list(Config) ->
     TarOne = filename:join(Dir, "archive1.tar"),
     {ok,AD} = erl_tar:open(TarOne, [write]),
     ok = erl_tar:add(AD, FileOne, []),
-    ok = erl_tar:add(AD, FileTwo, "second file", []),
-    ok = erl_tar:add(AD, FileThree, [verbose]),
+    % Add with {NameInArchive,Name}
+    ok = erl_tar:add(AD, {"second file", FileTwo}, []),
+    % Add with {binary, Bin}
+    {ok,FileThreeBin} = file:read_file(FileThree),
+    ok = erl_tar:add(AD, {FileThree, FileThreeBin}, [verbose]),
+    % Add with Name
     ok = erl_tar:add(AD, FileThree, "chunked", [{chunks,11411},verbose]),
     ok = erl_tar:add(AD, ADir, [verbose]),
     ok = erl_tar:add(AD, AnotherDir, [verbose]),
@@ -653,7 +718,8 @@ open_add_close(Config) when is_list(Config) ->
     ok = erl_tar:t(TarOne),
     ok = erl_tar:tt(TarOne),
 
-    {ok,[FileOne,"second file",FileThree,"chunked",ADir,SomeContent]} = erl_tar:table(TarOne),
+    Expected = {ok,[FileOne,"second file",FileThree,"chunked",ADir,SomeContent]},
+    Expected = erl_tar:table(TarOne),
 
     delete_files(["oac_file","oac_small","oac_big",Dir,AnotherDir,ADir]),
 
@@ -717,6 +783,40 @@ memory(Config) when is_list(Config) ->
     %% Clean up.
     ok = delete_files([Name1,Name2]),
     ok.
+
+read_other_implementations(Config) when is_list(Config) ->
+    DataDir = proplists:get_value(data_dir, Config),
+    Files = ["gnu.tar", "bsd.tar", "star.tar", "pax_mtime.tar"],
+    do_read_other_implementations(Files, DataDir).
+
+do_read_other_implementations([], _DataDir) ->
+    ok;
+do_read_other_implementations([File|Rest], DataDir) ->
+    io:format("~nTrying ~s", [File]),
+    Full = filename:join(DataDir, File),
+    {ok, _} = erl_tar:table(Full),
+    {ok, _} = erl_tar:extract(Full, [memory]),
+    do_read_other_implementations(Rest, DataDir).
+
+
+%% Test handling of sparse files
+sparse(Config) when is_list(Config) ->
+    DataDir = proplists:get_value(data_dir, Config),
+    PrivDir = proplists:get_value(priv_dir, Config),
+    Sparse01Empty = "sparse01_empty.tar",
+    Sparse01 = "sparse01.tar",
+    Sparse10Empty = "sparse10_empty.tar",
+    Sparse10 = "sparse10.tar",
+    do_sparse([Sparse01Empty, Sparse01, Sparse10Empty, Sparse10], DataDir, PrivDir).
+
+do_sparse([], _DataDir, _PrivDir) ->
+    ok;
+do_sparse([Name|Rest], DataDir, PrivDir) ->
+    io:format("~nTrying sparse file ~s", [Name]),
+    Full = filename:join(DataDir, Name),
+    {ok, [_]} = erl_tar:table(Full),
+    {ok, _} = erl_tar:extract(Full, [memory]),
+    do_sparse(Rest, DataDir, PrivDir).
 
 %% Test filenames with characters outside the US ASCII range.
 unicode(Config) when is_list(Config) ->
