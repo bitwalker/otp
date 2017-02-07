@@ -34,7 +34,6 @@
          extract/1, extract/2,
          table/1, table/2, t/1, tt/1,
          open/2, close/1,
-         parse_octal/1,
          add/3, add/4,
          format_error/1]).
 
@@ -109,6 +108,8 @@ extract({binary, Bin}, Opts) when is_list(Opts) ->
     do_extract({binary, Bin}, Opts);
 extract({file, Fd}, Opts) when is_list(Opts) ->
     do_extract({file, Fd}, Opts);
+extract(#reader{}=Reader, Opts) when is_list(Opts) ->
+    do_extract(Reader, Opts);
 extract(Name, Opts) when is_list(Name); is_binary(Name), is_list(Opts) ->
     do_extract(Name, Opts).
 
@@ -249,7 +250,7 @@ type_to_string(block)     -> "b";
 type_to_string(fifo)      -> "f";
 type_to_string(unknown)   -> "?".
 
-%% Converts a numeric mode to it's human-readable representation
+%% Converts a numeric mode to its human-readable representation
 mode_to_string(Mode) ->
     mode_to_string(Mode, "xwrxwrxwr", []).
 mode_to_string(Mode, [C|T], Acc) when Mode band 1 =:= 1 ->
@@ -317,10 +318,10 @@ open1({file, Fd}, read, _Raw, _Opts) ->
         {error, _} = Err ->
             Err
     end;
-open1(Name, Access, Raw, Opts) when is_list(Name) or is_binary(Name) ->
+open1(Name, Access, Raw, Opts) when is_list(Name); is_binary(Name) ->
     case file:open(Name, Raw ++ [binary, Access|Opts]) of
         {ok, File} ->
-            {ok, #reader{handle=File,access=Access,func=fun file_op/2}};
+            {ok, #reader{handle=File,output_file=Name,access=Access,func=fun file_op/2}};
         {error, Reason} ->
             {error, {Name, Reason}}
     end.
@@ -469,9 +470,8 @@ add1(#reader{}=Reader, Name, NameInArchive, #add_opts{read_info=ReadInfo}=Opts)
                   add_verbose(Opts, "a ~ts~n", [NameInArchive]),
                   Header = fileinfo_to_header(NameInArchive, Fi, false),
                   {ok, Reader2} = add_header(Reader, Header, Opts),
-                  {ok, File} = file:open(Name, [read, binary]),
                   FileSize = Header#tar_header.size,
-                  {ok, FileSize, Reader3} = do_copy(Reader2, File),
+                  {ok, FileSize, Reader3} = do_copy(Reader2, Name, Opts),
                   Padding = skip_padding(FileSize),
                   Pad = <<0:Padding/unit:8>>,
                   do_write(Reader3, Pad);
@@ -514,11 +514,12 @@ add_directory(Reader, DirName, NameInArchive, Info, Opts) ->
             add_header(Reader, Header, Opts);
         {ok, Files} ->
             add_verbose(Opts, "a ~ts~n", [NameInArchive]),
-            case catch add_files(Reader, Files, DirName, NameInArchive, Opts) of
+            try add_files(Reader, Files, DirName, NameInArchive, Opts) of
                 ok -> ok;
-                {ok, Reader2} -> {ok, Reader2};
-                {error, {_Name, _Reason}} = Err -> Err;
-                {error, Reason} -> {error, {DirName, Reason}}
+                {error, _} = Err -> Err
+            catch
+                throw:{error, {_Name, _Reason}} = Err -> Err;
+                throw:{error, Reason} -> {error, {DirName, Reason}}
             end;
         {error, Reason} ->
             {error, {DirName, Reason}}
@@ -526,6 +527,8 @@ add_directory(Reader, DirName, NameInArchive, Info, Opts) ->
 
 add_files(_Reader, [], _Dir, _DirInArchive, _Opts) ->
     ok;
+add_files(Reader=#reader{output_file=Name}, [Name|Rest], Dir, DirInArchive, Opts) ->
+    add_files(Reader, Rest, Dir, DirInArchive, Opts);
 add_files(Reader, [Name|Rest], Dir, DirInArchive, #add_opts{read_info=Info}=Opts) ->
     FullName = filename:join(Dir, Name),
     NameInArchive = filename:join(DirInArchive, Name),
@@ -543,9 +546,8 @@ add_files(Reader, [Name|Rest], Dir, DirInArchive, #add_opts{read_info=Info}=Opts
                   add_verbose(Opts, "a ~ts~n", [NameInArchive]),
                   Header = fileinfo_to_header(NameInArchive, Fi, false),
                   {ok, Reader2} = add_header(Reader, Header, Opts),
-                  {ok, File} = file:open(FullName, [read,binary]),
                   FileSize = Header#tar_header.size,
-                  {ok, FileSize, Reader3} = do_copy(Reader2, File),
+                  {ok, FileSize, Reader3} = do_copy(Reader2, FullName, Opts),
                   Padding = skip_padding(FileSize),
                   Pad = <<0:Padding/unit:8>>,
                   do_write(Reader3, Pad);
@@ -564,9 +566,10 @@ format_string(String, Size) when length(String) > Size ->
     throw({error, {write_string, field_too_long}});
 format_string(String, Size) ->
     Ascii = to_ascii(String),
-    if length(Ascii) < Size ->
+    if byte_size(Ascii) < Size ->
             [Ascii, 0];
-       true -> Ascii
+       true ->
+            Ascii
     end.
 
 format_octal(Octal) ->
@@ -666,7 +669,7 @@ build_pax_entry(Header, PaxAttrs, Opts) ->
     Path2 = filename:join([Dir, "PaxHeaders.0", Filename]),
     AsciiPath = to_ascii(Path2),
     Path3 = if byte_size(AsciiPath) > ?V7_NAME_LEN ->
-                    binary_part(AsciiPath, 0, ?V7_NAME_LEN);
+                    binary_part(AsciiPath, 0, ?V7_NAME_LEN - 1);
                true ->
                     AsciiPath
             end,
@@ -678,7 +681,7 @@ build_pax_entry(Header, PaxAttrs, Opts) ->
                    (byte_size(PaxFile) rem ?BLOCK_SIZE)) rem ?BLOCK_SIZE,
     Pad = <<0:Padding/unit:8>>,
     PaxHeader = #tar_header{
-                   name=Path3,
+                   name=unicode:characters_to_list(Path3),
                    size=Size,
                    mtime=Header#tar_header.mtime,
                    atime=Header#tar_header.atime,
@@ -728,7 +731,7 @@ to_string(N) when is_float(N) ->
 split_ustar_path(Path) ->
     Len = length(Path),
     NotAscii = not is_ascii(Path),
-    if Len =< ?V7_NAME_LEN orelse NotAscii ->
+    if Len =< ?V7_NAME_LEN; NotAscii ->
             false;
        true ->
             PathBin = binary:list_to_bin(Path),
@@ -811,7 +814,6 @@ read_block(Reader) ->
     case do_read(Reader, ?BLOCK_SIZE) of
         eof ->
             throw({error, eof});
-                                                %eof;
         %% Two zero blocks mark the end of the archive
         {ok, ?ZERO_BLOCK, Reader1} ->
             case do_read(Reader1, ?BLOCK_SIZE) of
@@ -944,12 +946,7 @@ do_get_format({error, _} = Err, _Bin) ->
     Err;
 do_get_format(#header_v7{}=V7, Bin)
   when is_binary(Bin), byte_size(Bin) =:= ?BLOCK_SIZE ->
-    Checksum = case catch parse_octal(V7#header_v7.checksum) of
-                   {'EXIT', _} ->
-                       throw({error, invalid_tar_checksum});
-                   Octal ->
-                       Octal
-               end,
+    Checksum = parse_octal(V7#header_v7.checksum),
     Chk1 = compute_checksum(Bin),
     Chk2 = compute_signed_checksum(Bin),
     if Checksum =/= Chk1 andalso Checksum =/= Chk2 ->
@@ -962,11 +959,11 @@ do_get_format(#header_v7{}=V7, Bin)
             Version = Ustar#header_ustar.version,
             Trailer = Star#header_star.trailer,
             Format = if
-                         Magic =:= ?MAGIC_USTAR andalso Trailer =:= ?TRAILER_STAR ->
+                         Magic =:= ?MAGIC_USTAR, Trailer =:= ?TRAILER_STAR ->
                              ?FORMAT_STAR;
                          Magic =:= ?MAGIC_USTAR ->
                              ?FORMAT_USTAR;
-                         Magic =:= ?MAGIC_GNU andalso Version =:= ?VERSION_GNU ->
+                         Magic =:= ?MAGIC_GNU, Version =:= ?VERSION_GNU ->
                              ?FORMAT_GNU;
                          true ->
                              ?FORMAT_V7
@@ -1010,7 +1007,7 @@ unpack_format(Format, #header_v7{}=V7, Bin, Reader)
             {Header3, new_sparse_file_reader(Reader2, Sparsemap, RealSize)};
        true ->
             FileReader = #reg_file_reader{
-                            handle = Reader,
+                            handle=Reader,
                             num_bytes=Header2#tar_header.size,
                             size=Header2#tar_header.size,
                             pos = 0
@@ -1041,11 +1038,11 @@ unpack_modern(Format, #header_v7{}=V7, Bin, #tar_header{}=Header0)
                             {parse_string(Ustar#header_ustar.prefix), H1};
                         ?FORMAT_STAR ->
                             Star = to_star(V7, Bin),
-                            Prefix0=parse_string(Star#header_star.prefix),
+                            Prefix0 = parse_string(Star#header_star.prefix),
                             Atime0 = Star#header_star.atime,
-                            Atime =posix_to_erlang_time(parse_numeric(Atime0)),
+                            Atime = posix_to_erlang_time(parse_numeric(Atime0)),
                             Ctime0 = Star#header_star.ctime,
-                            Ctime =posix_to_erlang_time(parse_numeric(Ctime0)),
+                            Ctime = posix_to_erlang_time(parse_numeric(Ctime0)),
                             {Prefix0, H1#tar_header{
                                         atime=Atime,
                                         ctime=Ctime
@@ -1161,19 +1158,20 @@ parse_numeric(<<First, _/binary>> = Bin) ->
             %% the data bytes and treat the value as an unsigned number
             Inv = if First band 16#40 =/= 0 -> 16#00; true -> 16#FF end,
             Bytes = binary:bin_to_list(Bin),
-            {_, N} = lists:foldl(fun (C, {I, X}) ->
-                                         C1 = C bxor Inv,
-                                         C2 = if I =:= 0 -> C1 band 16#7F; true -> C1 end,
-                                         if (X bsr 56) > 0 ->
-                                                 throw({error,integer_overflow});
-                                            true ->
-                                                 {I+1, (X bsl 8) bor C2}
-                                         end
-                                 end, {0, 0}, Bytes),
+            Reducer = fun (C, {I, X}) ->
+                              C1 = C bxor Inv,
+                              C2 = if I =:= 0 -> C1 band 16#7F; true -> C1 end,
+                              if (X bsr 56) > 0 ->
+                                      throw({error,integer_overflow});
+                                 true ->
+                                      {I+1, (X bsl 8) bor C2}
+                              end
+                      end,
+            {_, N} = lists:foldl(Reducer, {0,0}, Bytes),
             if (N bsr 63) > 0 ->
                     throw({error, integer_overflow});
                true ->
-                    if Inv == 16#FF ->
+                    if Inv =:= 16#FF ->
                             -1 bxor N;
                        true ->
                             N
@@ -1191,9 +1189,9 @@ do_parse_octal(<<>>, <<>>) ->
     0;
 do_parse_octal(<<>>, Acc) ->
     case io_lib:fread("~8u", binary:bin_to_list(Acc)) of
-        {error, _} -> throw({error, {bad_header, invalid_octal_value}});
+        {error, _} -> throw({error, invalid_tar_checksum});
         {ok, [Octal], []} -> Octal;
-        {ok, _, _} -> throw({error, {bad_header, invalid_octal_value}})
+        {ok, _, _} -> throw({error, invalid_tar_checksum})
     end;
 do_parse_octal(<<$\s,Rest/binary>>, Acc) ->
     do_parse_octal(Rest, Acc);
@@ -1275,19 +1273,23 @@ do_fileinfo_to_header(Header, Fi, _Link) ->
 
 is_ascii(Str) when is_list(Str) ->
     not lists:any(fun (Char) -> Char >= 16#80 end, Str);
-is_ascii(<<>>) ->
+is_ascii(Bin) when is_binary(Bin) ->
+    is_ascii1(Bin).
+
+is_ascii1(<<>>) ->
     true;
-is_ascii(<<C,_Rest/binary>>) when C >= 16#80 ->
+is_ascii1(<<C,_Rest/binary>>) when C >= 16#80 ->
     false;
-is_ascii(<<_, Rest/binary>>) ->
-    is_ascii(Rest).
+is_ascii1(<<_, Rest/binary>>) ->
+    is_ascii1(Rest).
 
 to_ascii(Str) when is_list(Str) ->
     case is_ascii(Str) of
         true ->
-            Str;
+            unicode:characters_to_binary(Str);
         false ->
-            lists:filter(fun (Char) -> Char < 16#80 end, Str)
+            Chars = lists:filter(fun (Char) -> Char < 16#80 end, Str),
+            unicode:characters_to_binary(Chars)
     end;
 to_ascii(Bin) when is_binary(Bin) ->
     to_ascii(Bin, <<>>).
@@ -1308,34 +1310,38 @@ posix_to_erlang_time(Sec) ->
     Time = calendar:now_to_datetime({Sec div OneMillion, Sec rem OneMillion, 0}),
     erlang:universaltime_to_localtime(Time).
 
+foldl_read(#reader{access=read}=Reader, Fun, Accu, #read_opts{}=Opts)
+  when is_function(Fun,4) ->
+    case foldl_read0(Reader, Fun, Accu, Opts) of
+        {ok, Result, _Reader2} ->
+            Result;
+        {error, _} = Err ->
+            Err
+    end;
+foldl_read(#reader{access=Access}, _Fun, _Accu, _Opts) ->
+    {error, {read_mode_expected, Access}};
 foldl_read(TarName, Fun, Accu, #read_opts{}=Opts)
   when is_function(Fun,4) ->
-    case catch open(TarName, [read|Opts#read_opts.open_mode]) of
-        {'EXIT', Reason} ->
-            {error, Reason};
-        {error, _} = Err ->
-            Err;
+    try open(TarName, [read|Opts#read_opts.open_mode]) of
         {ok, #reader{access=read}=Reader} ->
-            case foldl_read0(Reader, Fun, Accu, Opts) of
-                {ok, Result, Reader2} ->
-                    ok = do_close(Reader2),
-                    Result;
-                {error, _} = Err ->
-                    Err
-            end
+            foldl_read(Reader, Fun, Accu, Opts);
+        {error, _} = Err ->
+            Err
+    catch
+        throw:Err ->
+            Err
     end.
 
 foldl_read0(Reader, Fun, Accu, Opts) ->
-    case catch foldl_read1(Fun, Accu, Reader, Opts, #{}) of
-        {'EXIT', Reason} ->
-            {error, Reason};
-        {error, {Reason, Format, Args}} ->
+    try foldl_read1(Fun, Accu, Reader, Opts, #{}) of
+        {ok,_,_} = Ok ->
+            Ok
+    catch
+        throw:{error, {Reason, Format, Args}} ->
             read_verbose(Opts, Format, Args),
             {error, Reason};
-        {error, Reason} ->
-            {error, Reason};
-        Ok ->
-            Ok
+        throw:Err ->
+            Err
     end.
 
 foldl_read1(Fun, Accu0, Reader0, Opts, ExtraHeaders) ->
@@ -1692,10 +1698,36 @@ do_write(#reader{handle=Handle,func=Fun}=Reader0, Data)
             Err
     end.
 
-do_copy(#reader{handle=Handle,pos=Pos,func=Fun}=Reader, Source)
+do_copy(#reader{func=Fun}=Reader, Source, #add_opts{chunk_size=0}=Opts)
   when is_function(Fun, 2) ->
-    {ok, BytesCopied} = file:copy(Source, Handle),
-    {ok, BytesCopied, Reader#reader{pos=Pos+BytesCopied}}.
+    do_copy(Reader, Source, Opts#add_opts{chunk_size=65536});
+do_copy(#reader{func=Fun}=Reader, Source, #add_opts{chunk_size=ChunkSize})
+    when is_function(Fun, 2) ->
+    case file:open(Source, [read, binary]) of
+        {ok, SourceFd} ->
+            case copy_chunked(Reader, SourceFd, ChunkSize, 0) of
+                {ok, _Copied, _Reader2} = Ok->
+                    _ = file:close(SourceFd),
+                    Ok;
+                Err ->
+                    _ = file:close(SourceFd),
+                    throw(Err)
+            end;
+        Err ->
+            throw(Err)
+    end.
+
+copy_chunked(#reader{}=Reader, Source, ChunkSize, Copied) ->
+    case file:read(Source, ChunkSize) of
+        {ok, Bin} ->
+            {ok, Reader2} = do_write(Reader, Bin),
+            copy_chunked(Reader2, Source, ChunkSize, Copied+byte_size(Bin));
+        eof ->
+            {ok, Copied, Reader};
+        Other ->
+            Other
+    end.
+
 
 do_position(#reader{handle=Handle,func=Fun}=Reader, Pos)
   when is_function(Fun,2)->

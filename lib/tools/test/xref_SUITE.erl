@@ -90,11 +90,20 @@ init_per_suite(Conf) when is_list(Conf) ->
     PrivDir = ?privdir,
     CopyDir = fname(PrivDir, "datacopy"),
     TarFile = fname(PrivDir, "datacopy.tgz"),
+    io:fwrite("opening tar..\n", []),
     {ok, Tar} = erl_tar:open(TarFile, [write, compressed]),
+    io:fwrite("opened tar ~p..\n", [TarFile]),
+    io:fwrite("adding ~p to tar\n", [DataDir]),
     ok = erl_tar:add(Tar, DataDir, CopyDir, [compressed]),
+    io:fwrite("add successful\n", []),
+    io:fwrite("closing tar\n", []),
     ok = erl_tar:close(Tar),
+    io:fwrite("closed tar\n", []),
+    io:fwrite("extracting tar\n", []),
     ok = erl_tar:extract(TarFile, [compressed]),
+    io:fwrite("tar extracted!\n", []),
     ok = file:delete(TarFile),
+    io:fwrite("deleted tar\n", []),
     [{copy_dir, CopyDir}|Conf].
 
 end_per_suite(Conf) when is_list(Conf) ->

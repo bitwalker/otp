@@ -1075,8 +1075,11 @@ chk_tar(Items, TarFileName, Config, Opts)  when is_list(Opts) ->
     tar_size(TarFileName, Config),
     {ChPid,_} = proplists:get_value(sftp,Config),
     {ok,HandleRead} = ssh_sftp:open_tar(ChPid, TarFileName, [read|Opts]),
-    {ok,NameValueList} = erl_tar:extract(HandleRead,[memory,verbose]),
+    io:fwrite("contents: ~p", [erl_tar:table(HandleRead, [verbose])]),
+    {ok,HandleRead2} = ssh_sftp:open_tar(ChPid, TarFileName, [read|Opts]),
     ok = erl_tar:close(HandleRead),
+    {ok,NameValueList} = erl_tar:extract(HandleRead2,[memory,verbose]),
+    ok = erl_tar:close(HandleRead2),
     case {lists:sort(expand_items(Items,Config)), lists:sort(NameValueList)} of
 	{L,L} -> 
 	    true;

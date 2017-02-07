@@ -361,7 +361,7 @@ make_dirs([], Dir) ->
 %% Try erl_tar:table/2 and erl_tar:extract/2 on some corrupted tar files.
 bad_tar(Config) when is_list(Config) ->
     try_bad("bad_checksum", bad_header, Config),
-    try_bad("bad_octal",    {bad_header, invalid_octal_value}, Config),
+    try_bad("bad_octal",    invalid_tar_checksum, Config),
     try_bad("bad_too_short",    eof, Config),
     try_bad("bad_even_shorter", eof, Config),
     ok.
